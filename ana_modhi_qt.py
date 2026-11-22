@@ -129,6 +129,113 @@ def check_stt_report():
                          % (type(exc).__name__, exc))
 
 
+# ---------------------------------------------------------- نطق عصبي أونلاين
+# صوت سلمى المصرية العصبي عبر حزمة edge-tts (تحتاج إنترنت و pip install edge-tts).
+# عند غياب الحزمة أو فشل الاتصال يرجع التطبيق تلقائياً لمحرك ويندوز (WinRT/SAPI).
+import asyncio
+import queue
+import tempfile
+import threading
+
+try:
+    import edge_tts as _edge_tts
+    _HAS_EDGE_TTS = True
+except Exception:
+    _edge_tts = None
+    _HAS_EDGE_TTS = False
+
+
+class _EdgeTtsWorker:
+    """خيط نطق عصبي: يحوّل النص إلى MP3 عبر edge-tts ثم يشغّله عبر winmm.
+
+    say() يلغي أي نطق سابق (سلوك QUEUE_FLUSH)، وعند فشل التحويل يمرر النص
+    إلى دالة الرجوع الاحتياطي (محرك ويندوز) حتى لا يضيع على المستخدم.
+    """
+    VOICE = "ar-EG-SalmaNeural"
+
+    def __init__(self, on_fallback):
+        self._q = queue.Queue()
+        self._on_fallback = on_fallback
+        self._gen = 0
+        self._lock = threading.Lock()
+        self._alive = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def say(self, rate_pct, text):
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+        self._mci("close anatts")
+        self._q.put((gen, rate_pct, text))
+
+    def stop(self):
+        with self._lock:
+            self._gen += 1
+        self._mci("close anatts")
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def shutdown(self):
+        self.stop()
+        self._alive = False
+        self._q.put((-1, 0, ""))
+
+    @staticmethod
+    def _mci(cmd):
+        try:
+            ctypes.windll.winmm.mciSendStringW(cmd, None, 0, None)
+        except Exception:
+            pass
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        tmp = os.path.join(tempfile.gettempdir(), "ana_modhi_salma.mp3")
+        while True:
+            gen, rate_pct, text = self._q.get()
+            if not self._alive or gen < 0:
+                return
+            if not text:
+                continue
+            with self._lock:
+                if gen != self._gen:
+                    continue
+            ok = False
+            try:
+                rate = ("+%d%%" % rate_pct) if rate_pct >= 0 else ("%d%%" % rate_pct)
+                comm = _edge_tts.Communicate(text, self.VOICE, rate=rate)
+                loop.run_until_complete(comm.save(tmp))
+                ok = os.path.getsize(tmp) > 100
+            except Exception:
+                ok = False
+            if not ok:
+                self._on_fallback(text)
+                continue
+            with self._lock:
+                if gen != self._gen:
+                    continue
+            self._mci('open "%s" type mpegvideo alias anatts' % tmp)
+            self._mci("play anatts")
+            # انتظار انتهاء التشغيل أو طلب إيقاف/نطق جديد
+            buf = ctypes.create_unicode_buffer(64)
+            while True:
+                time.sleep(0.05)
+                with self._lock:
+                    if gen != self._gen:
+                        break
+                try:
+                    ctypes.windll.winmm.mciSendStringW(
+                        "status anatts mode", buf, 64, None)
+                    if buf.value != "playing":
+                        break
+                except Exception:
+                    break
+
+
 class _SttSignals(QObject):
     """نقل نتيجة التفريغ من خيط العامل إلى خيط الواجهة بأمان."""
     done = pyqtSignal(dict)
@@ -261,6 +368,8 @@ class AnaModhiQt(QMainWindow):
         self.recorder = None
         self.last_rec = {}                 # آخر تسجيل صالح لكل تحدي، لزر الاستماع
         self.tts_proc = self._start_tts()
+        # الصوت العصبي (سلمى) أساسي عند توفر edge-tts، ومحرك ويندوز احتياطي.
+        self.edge_worker = _EdgeTtsWorker(self._speak_fallback) if _HAS_EDGE_TTS else None
         self._build()
 
     # ------------------------------------------------------------------خطوط
@@ -371,15 +480,10 @@ class AnaModhiQt(QMainWindow):
         except Exception:
             return None
 
-    def speak(self, text):
-        log = os.environ.get("ANOMODHI_LOG")
-        if log:
-            try:
-                with open(log, "a", encoding="utf-8") as fh:
-                    fh.write((text or "") + "\n")
-            except Exception:
-                pass
-        if not self.prog.get("tts") or not text or not self.tts_proc or not self.tts_proc.stdin:
+    def _speak_fallback(self, text):
+        """نطق عبر محرك ويندوز (WinRT/SAPI): يُستخدم احتياطياً عند غياب
+        الصوت العصبي أو فشل الاتصال به."""
+        if not text or not self.tts_proc or not self.tts_proc.stdin:
             return
         rate = -6 + self.prog.get("rate", 6)
         try:
@@ -388,7 +492,25 @@ class AnaModhiQt(QMainWindow):
         except Exception:
             pass
 
+    def speak(self, text):
+        log = os.environ.get("ANOMODHI_LOG")
+        if log:
+            try:
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write((text or "") + "\n")
+            except Exception:
+                pass
+        if not self.prog.get("tts") or not text:
+            return
+        if self.edge_worker is not None:
+            # سرعة 1..10 تصبح ‎-50%..+40%‎ للصوت العصبي
+            self.edge_worker.say((self.prog.get("rate", 6) - 6) * 10, text)
+            return
+        self._speak_fallback(text)
+
     def speak_stop(self):
+        if self.edge_worker is not None:
+            self.edge_worker.stop()
         if self.tts_proc and self.tts_proc.stdin:
             try:
                 self.tts_proc.stdin.write(b"STOP\n")
@@ -2214,6 +2336,8 @@ class AnaModhiQt(QMainWindow):
     def quit_app(self):
         self.speak_stop()
         self._leave_recording()
+        if self.edge_worker is not None:
+            self.edge_worker.shutdown()
         if self.tts_proc and self.tts_proc.stdin:
             try:
                 self.tts_proc.stdin.write(b"EXIT\n")
